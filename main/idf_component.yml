@@ -1,4 +1,6 @@
 dependencies:
-  espressif/mdns: "*"
+  espressif/mdns: '*'
   idf:
-    version: ">=4.1.0"
+    version: '>=4.1.0'
+  nixy4/u8g2: ^0.1.4
+  esp-idf-lib/encoder: ^3.0.2

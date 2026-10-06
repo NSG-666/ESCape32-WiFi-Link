@@ -108,6 +108,16 @@ button:hover {
 button:active {
 	background: var(--ccc);
 }
+button.btn-reboot {
+	background: #c62828;
+	color: #fff;
+}
+button.btn-reboot:hover {
+	background: #e53935;
+}
+button.btn-reboot:active {
+	background: #b71c1c;
+}
 textarea {
 	height: 8em;
 	width: 20em;
@@ -194,6 +204,41 @@ progress {
 	line-height: 1.2em;
 	white-space: pre;
 }
+#telem {
+	margin-top: 0.6em;
+}
+#telemtoolbar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: 0.4em;
+	margin-bottom: 0.4em;
+}
+#telemseries {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.3em 0.8em;
+	font-size: 0.85em;
+}
+#telemseries label {
+	cursor: pointer;
+	user-select: none;
+}
+#telemctrl {
+	display: flex;
+	align-items: center;
+	gap: 0.4em;
+	margin-left: auto;
+}
+#telemchart {
+	display: block;
+	width: 100%;
+	height: 180px;
+	background: var(--eee);
+	border: 1px solid var(--ddd);
+	border-radius: 4px;
+}
 #fwinfo {
 	white-space: nowrap;
 }
@@ -216,13 +261,54 @@ progress {
 		<table class="show" id="show"></table>
 		<p>
 			<button data-lang="B00" onclick="savecfg()"></button>
+			<button data-lang="B06" onclick="exportcfg()"></button>
+			<button data-lang="B07" onclick="document.getElementById('cfgfile').click()"></button>
+			<input type="file" id="cfgfile" accept=".json,application/json" style="display:none" onchange="importcfg(this)">
 			<button data-lang="B01" onpointerdown="resetcfg()" onpointerup="resetcfg(true)" onpointerleave="resetcfg(true)" onpointercancel="resetcfg(true)"></button>
+			<button class="btn-reboot" data-lang="B08" onclick="rebootesc()"></button>
 			<span class="result" id="result1"></span>
 		</p>
 		<hr>
 		<div id="info"></div>
 		<input type="range" min="0" max="2000" value="0" id="throt" oninput="setthrot(value)">
 		<div class="hint" data-lang="H00"></div>
+		<div id="telem">
+			<div id="telemtoolbar">
+				<div id="telemseries">
+					<label><input type="radio" name="telemseries" value="Temp" onchange="drawTelemChart()"> Temp</label>
+					<label><input type="radio" name="telemseries" value="ext" onchange="drawTelemChart()"> ext</label>
+					<label><input type="radio" name="telemseries" value="Volt" checked onchange="drawTelemChart()"> Volt</label>
+					<label><input type="radio" name="telemseries" value="Curr" onchange="drawTelemChart()"> Curr</label>
+					<label><input type="radio" name="telemseries" value="Csum" onchange="drawTelemChart()"> Csum</label>
+					<label><input type="radio" name="telemseries" value="ERPM" onchange="drawTelemChart()"> ERPM</label>
+				</div>
+				<div id="telemctrl">
+					<button id="telemrun" data-lang="B10" onclick="toggleTelemRun()"></button>
+					<button id="telemclr" data-lang="B03" onclick="clearTelemChart()"></button>
+					<button id="telemexport" data-lang="B11" onclick="exportTelemCsv()"></button>
+					<select id="telemhz" onchange="setTelemHz(value)">
+						<option value="2" selected>2hz</option>
+						<option value="4">4hz</option>
+						<option value="6">6hz</option>
+						<option value="8">8hz</option>
+						<option value="10">10hz</option>
+					</select>
+					<select id="telemwin" onchange="setTelemWindow(value)">
+						<option value="1" selected>1min</option>
+						<option value="2">2min</option>
+						<option value="3">3min</option>
+						<option value="4">4min</option>
+						<option value="5">5min</option>
+						<option value="6">6min</option>
+						<option value="7">7min</option>
+						<option value="8">8min</option>
+						<option value="9">9min</option>
+						<option value="10">10min</option>
+					</select>
+				</div>
+			</div>
+			<canvas id="telemchart" width="640" height="180"></canvas>
+		</div>
 	</div>
 	<div class="tab" id="tab2off" data-lang="S04"></div>
 	<div class="tab" id="tab2on">
@@ -342,6 +428,7 @@ async function setlang(lang) {
 			const key = elem.getAttribute('data-lang');
 			elem.innerHTML = strs[key] || '';
 		});
+		updateTelemRunLabel();
 	} catch (err) {
 		if (lang == 'en') throw err;
 		setlang('en');
@@ -402,7 +489,7 @@ function opentab(n) {
 				timer = setTimeout(() => {delayed = null, opentab(1)}, 2000);
 				break;
 			}
-			ival = setInterval(() => {send('info\n')}, 500);
+			ival = startInfoPoll();
 			send('info\n');
 			send('show\n');
 			resettimer(1);
@@ -527,6 +614,10 @@ const handlers = {
 	info: (data) => {
 		if (!data) return;
 		document.getElementById('info').innerHTML = data.join('<br>');
+		if (telemRunning) {
+			pushTelem(parseTelem(data));
+			drawTelemChart();
+		}
 		resettimer(1);
 	},
 	show: (data) => {
@@ -557,10 +648,18 @@ const handlers = {
 		else if (!tabvis[3]) send('_info\n');
 		resettimer(3);
 	},
+	_reboot: (ok) => {
+		setresult(1, !!ok, ok ? 'S32' : 'S16', 3);
+		if (!ok) {
+			opentab(1);
+			return;
+		}
+		setTimeout(() => opentab(1), 700);
+	},
 	_info: (data) => {
 		if (!data) return;
 		const res = [];
-		const pins = ['PA2', 'PA6', 'PB4'];
+		const pins = ['PA2', 'PA6', 'PB4', 'PA5'];
 		const [rev, pin, mcu] = data[0].split(' ');
 		target = data[1] && data[2];
 		res.push(`<span data-lang="S11">${strs['S11']}</span> ${rev}` + (pin != 0 ? ` [IO:${pins[pin - 1] || pin}, MCU:${mcu}]` : ''));
@@ -629,6 +728,247 @@ function setthrot(val) {
 	throtval = val;
 }
 
+const TELEM_UNITS = {Temp: 'C', ext: 'C', Volt: 'V', Curr: 'A', Csum: 'mAh', ERPM: ''};
+const telemBuf = {t: [], Temp: [], ext: [], Volt: [], Curr: [], Csum: [], ERPM: []};
+let telemRunning = true;
+let telemHz = 2;
+let telemWindowMin = 1;
+let telemFreezeAt = null;
+
+function telemWindowMs() {
+	return telemWindowMin * 60000;
+}
+
+function trimTelemBuf(ref) {
+	if (ref == null) ref = telemRunning ? Date.now() : (telemFreezeAt ?? Date.now());
+	const cut = ref - telemWindowMs();
+	while (telemBuf.t.length && telemBuf.t[0] < cut) {
+		telemBuf.t.shift();
+		for (const key of Object.keys(TELEM_UNITS)) telemBuf[key].shift();
+	}
+}
+
+function startInfoPoll() {
+	clearInterval(ival);
+	if (tabnum !== 1) return null;
+	return setInterval(() => {send('info\n')}, 1000 / telemHz);
+}
+
+function updateTelemRunLabel() {
+	const el = document.getElementById('telemrun');
+	if (!el || !strs) return;
+	const key = telemRunning ? 'B10' : 'B09';
+	el.setAttribute('data-lang', key);
+	el.innerHTML = strs[key] || '';
+}
+
+function toggleTelemRun() {
+	telemRunning = !telemRunning;
+	if (telemRunning) telemFreezeAt = null;
+	else telemFreezeAt = Date.now();
+	updateTelemRunLabel();
+	drawTelemChart();
+}
+
+function clearTelemChart() {
+	const key = getTelemSeries();
+	const ys = telemBuf[key];
+	if (!ys) return;
+	for (let i = 0; i < ys.length; ++i) ys[i] = null;
+	drawTelemChart();
+}
+
+function setTelemHz(val) {
+	telemHz = Number(val) || 2;
+	document.getElementById('telemhz').value = String(telemHz);
+	ival = startInfoPoll();
+	if (tabnum === 1) send('info\n');
+}
+
+function setTelemWindow(val) {
+	telemWindowMin = Number(val) || 1;
+	document.getElementById('telemwin').value = String(telemWindowMin);
+	trimTelemBuf();
+	drawTelemChart();
+}
+
+function exportTelemCsv() {
+	const n = telemBuf.t.length;
+	if (!n) return;
+	const keys = Object.keys(TELEM_UNITS);
+	let csv = 'time_ms,' + keys.join(',') + '\n';
+	for (let i = 0; i < n; ++i) {
+		const row = [telemBuf.t[i]];
+		for (const key of keys) {
+			const v = telemBuf[key][i];
+			row.push(v == null || Number.isNaN(v) ? '' : v);
+		}
+		csv += row.join(',') + '\n';
+	}
+	const d = new Date();
+	const pad = (x) => String(x).padStart(2, '0');
+	const info = (document.getElementById('info').textContent || '').split('\n')[0];
+	const m = info.match(/rev([\d.]+)\s*\[([^\]]+)\]/i);
+	const prefix = m ? m[2] : 'escape32';
+	const fname = `${prefix}-telem-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.csv`;
+	const blob = new Blob([csv], {type: 'text/csv;charset=utf-8'});
+	const a = document.createElement('a');
+	a.href = URL.createObjectURL(blob);
+	a.download = fname;
+	a.click();
+	URL.revokeObjectURL(a.href);
+}
+
+function parseTelem(data) {
+	const text = data.join('\n');
+	const num = (re) => {
+		const m = text.match(re);
+		return m ? Number(m[1]) : null;
+	};
+	return {
+		Temp: num(/Temp:\s*(-?[\d.]+)/),
+		ext: num(/ext\s+(-?[\d.]+)/),
+		Volt: num(/Volt:\s*(-?[\d.]+)/),
+		Curr: num(/Curr:\s*(-?[\d.]+)/),
+		Csum: num(/Csum:\s*(-?[\d.]+)/),
+		ERPM: num(/ERPM:\s*(-?[\d.]+)/),
+	};
+}
+
+function pushTelem(vals) {
+	const now = Date.now();
+	telemBuf.t.push(now);
+	for (const key of Object.keys(TELEM_UNITS)) telemBuf[key].push(vals[key]);
+	trimTelemBuf(now);
+}
+
+function getTelemSeries() {
+	const el = document.querySelector('input[name="telemseries"]:checked');
+	return el ? el.value : 'Volt';
+}
+
+function drawTelemChart() {
+	const canvas = document.getElementById('telemchart');
+	if (!canvas) return;
+	const dpr = window.devicePixelRatio || 1;
+	const cssW = canvas.clientWidth || canvas.parentElement.clientWidth || 320;
+	const cssH = 180;
+	if (canvas.width != Math.round(cssW * dpr) || canvas.height != Math.round(cssH * dpr)) {
+		canvas.width = Math.round(cssW * dpr);
+		canvas.height = Math.round(cssH * dpr);
+	}
+	const ctx = canvas.getContext('2d');
+	ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+	const W = cssW, H = cssH;
+	const padL = 48, padR = 10, padT = 12, padB = 22;
+	const plotW = Math.max(1, W - padL - padR);
+	const plotH = Math.max(1, H - padT - padB);
+	const style = getComputedStyle(document.documentElement);
+	const bg = style.getPropertyValue('--eee').trim() || '#333';
+	const fg = style.getPropertyValue('--222').trim() || '#ddd';
+	const grid = style.getPropertyValue('--ddd').trim() || '#444';
+	const line = style.getPropertyValue('--sel').trim() || '#72a2e0';
+
+	ctx.clearRect(0, 0, W, H);
+	ctx.fillStyle = bg;
+	ctx.fillRect(0, 0, W, H);
+
+	const key = getTelemSeries();
+	const unit = TELEM_UNITS[key] || '';
+	const now = telemRunning ? Date.now() : (telemFreezeAt ?? Date.now());
+	const winMs = telemWindowMs();
+	const t0 = now - winMs;
+	const xs = telemBuf.t;
+	const ys = telemBuf[key] || [];
+	const pts = [];
+	for (let i = 0; i < xs.length; ++i) {
+		if (ys[i] == null || Number.isNaN(ys[i])) continue;
+		if (xs[i] < t0) continue;
+		pts.push({x: xs[i], y: ys[i]});
+	}
+
+	let ymin = 0, ymax = 1;
+	if (pts.length) {
+		ymin = ymax = pts[0].y;
+		for (const p of pts) {
+			if (p.y < ymin) ymin = p.y;
+			if (p.y > ymax) ymax = p.y;
+		}
+	}
+	if (ymax <= ymin) {
+		const pad = Math.max(1, Math.abs(ymin) * 0.05) || 1;
+		ymin -= pad;
+		ymax += pad;
+	} else {
+		const pad = (ymax - ymin) * 0.08;
+		ymin -= pad;
+		ymax += pad;
+	}
+
+	const xOf = (t) => padL + ((t - t0) / winMs) * plotW;
+	const yOf = (v) => padT + (1 - (v - ymin) / (ymax - ymin)) * plotH;
+
+	ctx.strokeStyle = grid;
+	ctx.lineWidth = 1;
+	ctx.fillStyle = fg;
+	ctx.font = '11px Menlo, Monaco, Consolas, monospace';
+	ctx.textAlign = 'right';
+	ctx.textBaseline = 'middle';
+	for (let i = 0; i <= 4; ++i) {
+		const v = ymin + (ymax - ymin) * (i / 4);
+		const y = yOf(v);
+		ctx.beginPath();
+		ctx.moveTo(padL, y);
+		ctx.lineTo(W - padR, y);
+		ctx.stroke();
+		const label = Math.abs(v) >= 100 ? v.toFixed(0) : (Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2));
+		ctx.fillText(unit ? `${label}${unit}` : label, padL - 4, y);
+	}
+
+	ctx.textAlign = 'center';
+	ctx.textBaseline = 'top';
+	const totalSec = telemWindowMin * 60;
+	const useMin = totalSec >= 120;
+	const axisLabel = (sec) => {
+		if (sec === 0) return '0s';
+		if (useMin) return `-${sec / 60}min`;
+		return `-${sec}s`;
+	};
+	for (const sec of [totalSec, totalSec / 2, 0]) {
+		const t = now - sec * 1000;
+		const x = xOf(t);
+		ctx.beginPath();
+		ctx.moveTo(x, padT);
+		ctx.lineTo(x, padT + plotH);
+		ctx.stroke();
+		ctx.fillText(axisLabel(sec), x, padT + plotH + 4);
+	}
+
+	ctx.strokeStyle = fg;
+	ctx.strokeRect(padL + 0.5, padT + 0.5, plotW - 1, plotH - 1);
+
+	if (!pts.length) {
+		ctx.textAlign = 'center';
+		ctx.textBaseline = 'middle';
+		ctx.fillStyle = fg;
+		ctx.fillText(key, padL + plotW / 2, padT + plotH / 2);
+		return;
+	}
+
+	ctx.strokeStyle = line;
+	ctx.lineWidth = 1.5;
+	ctx.beginPath();
+	for (let i = 0; i < pts.length; ++i) {
+		const x = xOf(pts[i].x);
+		const y = yOf(pts[i].y);
+		if (i === 0) ctx.moveTo(x, y);
+		else ctx.lineTo(x, y);
+	}
+	ctx.stroke();
+}
+
+window.addEventListener('resize', () => drawTelemChart());
+
 function setvolume(val) {
 	document.getElementById('volume').value = val;
 	document.getElementById('volval').innerHTML = `${val}%`;
@@ -636,6 +976,85 @@ function setvolume(val) {
 
 function savecfg() {
 	send('save\n');
+}
+
+function collectcfg() {
+	const cfg = {};
+	const labels = document.querySelectorAll('#show label[id^="label_"]');
+	for (let i = 0; i < labels.length; ++i) {
+		const key = labels[i].id.slice(6);
+		let val;
+		if (key in bitvals) {
+			val = Number(bitvals[key]);
+		} else {
+			const elem = document.getElementById('field_' + key);
+			if (!elem) continue;
+			if (elem.type == 'checkbox') val = !!elem.checked;
+			else if (elem.type == 'select-one' || /^-?\d+$/.test(elem.value)) val = Number(elem.value);
+			else val = elem.value;
+		}
+		cfg[key] = val;
+	}
+	return cfg;
+}
+
+function exportcfg() {
+	const cfg = collectcfg();
+	if (!Object.keys(cfg).length) {
+		setresult(1, false, 'S31', 3);
+		return;
+	}
+	const obj = {version: 1};
+	const info = (document.getElementById('info').textContent || '').split('\n')[0];
+	const m = info.match(/rev([\d.]+)\s*\[([^\]]+)\]/i);
+	if (m) obj.target = m[2];
+	obj.config = cfg;
+	const blob = new Blob([JSON.stringify(obj, null, 2) + '\n'], {type: 'application/json'});
+	const a = document.createElement('a');
+	a.href = URL.createObjectURL(blob);
+	a.download = m ? `${m[2]}-rev${m[1]}.json` : 'escape32-cfg.json';
+	a.click();
+	URL.revokeObjectURL(a.href);
+	setresult(1, true, 'S30', 3);
+}
+
+function importcfg(input) {
+	const file = input.files && input.files[0];
+	input.value = '';
+	if (!file) return;
+	const fr = new FileReader();
+	fr.onload = () => {
+		let obj;
+		try {
+			obj = JSON.parse(fr.result);
+		} catch (e) {
+			setresult(1, false, 'S31', 3);
+			return;
+		}
+		let cfg = obj && typeof obj.config == 'object' && obj.config ? obj.config : obj;
+		if (!cfg || typeof cfg != 'object' || Array.isArray(cfg)) {
+			setresult(1, false, 'S31', 3);
+			return;
+		}
+		const skip = {version: 1, target: 1, config: 1};
+		let n = 0;
+		for (const key in cfg) {
+			if (skip[key] || typeof cfg[key] == 'object') continue;
+			let val = cfg[key];
+			if (typeof val == 'boolean') val = val ? '1' : '0';
+			else val = String(val);
+			setparam(key, val);
+			++n;
+		}
+		if (!n) {
+			setresult(1, false, 'S31', 3);
+			return;
+		}
+		setresult(1, true, 'S18', 3);
+		setTimeout(() => send('show\n'), 400);
+	};
+	fr.onerror = () => setresult(1, false, 'S31', 3);
+	fr.readAsText(file);
 }
 
 function resetcfg(cancel) {
@@ -646,6 +1065,14 @@ function resetcfg(cancel) {
 	if (cancel) return;
 	rt = setTimeout(() => {rt = null, send('reset\n')}, 2000);
 	setresult(1, null, 'S29', 5);
+}
+
+function rebootesc() {
+	if (blocked) return;
+	clearInterval(ival);
+	ival = null;
+	setresult(1, null, 'S32', 0);
+	send('_reboot\n');
 }
 
 function parsemusic() {
@@ -791,6 +1218,7 @@ function update() {
 setlang(localStorage.getItem('lang') || navigator.language.substring(0, 2) || 'en');
 setvolume(25);
 opentab(1);
+drawTelemChart();
 </script>
 </body>
 </html>

@@ -25,9 +25,18 @@
 #include "lwip/sockets.h"
 #include "mdns.h"
 #include "build_defs.h"
+#include "oled_ui.h"
+#include "encoder_ui.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
 
-#define SSID "ESCape32-WiFi-Link"
+#define SSID_PREFIX "WiFi-Link-"
 #define HOSTNAME "escape32"
+
+static char ap_ssid[sizeof(SSID_PREFIX) + 12]; /* WiFi-Link- + 12 hex + NUL */
 
 #define CMD_PROBE  0
 #define CMD_INFO   1
@@ -143,6 +152,25 @@ static void sendbuf(const uint8_t *buf, int len) {
 	uart_write_bytes(CONFIG_UART_NUM, buf, len);
 }
 
+static int esc_cli_xfer(const char *cmd, char *resp, size_t resp_sz)
+{
+	if (!cmd || !resp || resp_sz < 2) return -1;
+	sendbuf((const uint8_t *)cmd, (int)strlen(cmd));
+	int n = recvbuf((uint8_t *)resp, (int)resp_sz - 1, 0);
+	if (n <= 0) return -1;
+	int ok = 0;
+	if (n >= 3 && !memcmp(resp + n - 3, "OK\n", 3)) {
+		n -= 3;
+		ok = 1;
+	} else if (n >= 6 && !memcmp(resp + n - 6, "ERROR\n", 6)) {
+		return -1;
+	} else {
+		return -1;
+	}
+	resp[n] = 0;
+	return ok ? n : -1;
+}
+
 static int recvval(void) {
 	uint8_t buf[2];
 	return recvbuf(buf, 2, 1) && (buf[0] ^ buf[1]) == 0xff ? buf[0] : -1;
@@ -229,6 +257,12 @@ static esp_err_t wshandler(httpd_req_t *req) {
 			if (httpd_ws_recv_frame(req, &frame, sizeof buf)) return -1;
 			char *arg;
 			if ((arg = checkcmd(buf, len, "_probe"))) {
+				if (*arg != '\n') goto done;
+				sendval(CMD_PROBE);
+				res = recvval();
+				goto done;
+			}
+			if ((arg = checkcmd(buf, len, "_reboot"))) {
 				if (*arg != '\n') goto done;
 				sendval(CMD_PROBE);
 				res = recvval();
@@ -385,25 +419,6 @@ void app_main(void) {
 	ESP_ERROR_CHECK(nvs_flash_init());
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
-	esp_netif_create_default_wifi_ap();
-
-	wifi_init_config_t wicfg = WIFI_INIT_CONFIG_DEFAULT();
-	ESP_ERROR_CHECK(esp_wifi_init(&wicfg));
-
-	wifi_config_t wcfg = {
-		.ap = {
-			.ssid = SSID,
-			.ssid_len = sizeof SSID - 1,
-			.max_connection = 1,
-			.authmode = WIFI_AUTH_OPEN,
-		},
-	};
-	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wcfg));
-	ESP_ERROR_CHECK(esp_wifi_start());
-
-	ESP_ERROR_CHECK(mdns_init());
-	ESP_ERROR_CHECK(mdns_hostname_set(HOSTNAME));
 
 	uart_config_t ucfg = {
 		.baud_rate = 38400,
@@ -417,6 +432,44 @@ void app_main(void) {
 	ESP_ERROR_CHECK(uart_param_config(CONFIG_UART_NUM, &ucfg));
 	ESP_ERROR_CHECK(uart_set_pin(CONFIG_UART_NUM, CONFIG_UART_TX, CONFIG_UART_RX, -1, -1));
 	ESP_ERROR_CHECK(uart_set_mode(CONFIG_UART_NUM, UART_MODE_RS485_HALF_DUPLEX));
+
+	gpio_config_t bootcfg = {
+		.pin_bit_mask = 1ULL << BOOT_PIN,
+		.mode = GPIO_MODE_INPUT,
+		.pull_up_en = GPIO_PULLUP_ENABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_DISABLE,
+	};
+	ESP_ERROR_CHECK(gpio_config(&bootcfg));
+	oled_ui_init();
+	encoder_ui_init();
+	oled_ui_loop(esc_cli_xfer);
+
+	esp_netif_create_default_wifi_ap();
+
+	wifi_init_config_t wicfg = WIFI_INIT_CONFIG_DEFAULT();
+	ESP_ERROR_CHECK(esp_wifi_init(&wicfg));
+
+	uint8_t mac[6];
+	ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_AP, mac));
+	snprintf(ap_ssid, sizeof ap_ssid, "%s%02X%02X%02X%02X%02X%02X",
+		SSID_PREFIX, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+	oled_ui_show_wifi(ap_ssid);
+
+	wifi_config_t wcfg = {
+		.ap = {
+			.max_connection = 1,
+			.authmode = WIFI_AUTH_OPEN,
+		},
+	};
+	snprintf((char *)wcfg.ap.ssid, sizeof wcfg.ap.ssid, "%s", ap_ssid);
+	wcfg.ap.ssid_len = 0;
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wcfg));
+	ESP_ERROR_CHECK(esp_wifi_start());
+
+	ESP_ERROR_CHECK(mdns_init());
+	ESP_ERROR_CHECK(mdns_hostname_set(HOSTNAME));
 
 	httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
 	hcfg.max_open_sockets = CONFIG_LWIP_MAX_SOCKETS - 3;
@@ -444,11 +497,16 @@ void app_main(void) {
 		close(fd);
 		return;
 	}
+	struct timeval tv = { .tv_sec = 0, .tv_usec = 40000 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 	setled(0);
 	for (;;) {
+		oled_ui_wifi_tick();
 		uint8_t buf[512];
 		int len1 = recvfrom(fd, buf, sizeof buf - 1, 0, (struct sockaddr *)&sa, &sl);
 		if (len1 == -1) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
 			ESP_LOGE("dns", "recvfrom() failed: %s", strerror(errno));
 			break;
 		}
